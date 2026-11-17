@@ -8,10 +8,12 @@ HTTPS and is the sole remote entrypoint, so the dashboard remains tailnet-only.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import hmac
 import json
 import mimetypes
+import re
 import threading
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -168,7 +170,13 @@ def build_dashboard(config: DashboardConfig, today: date | None = None) -> tuple
     tasks = load_task_ledger(vault / "任务台.md")
     cases = load_case_ledger(vault / "工作" / "case-ledger.md")
     life_wheel = load_life_wheel(vault / "人生轮.md")
-    html = render_page(records, month, tasks, life_wheel, cases)
+    daily_root = vault / "daily-log"
+    available_months = sorted(
+        path.name
+        for path in daily_root.iterdir()
+        if path.is_dir() and re.fullmatch(r"\d{4}-\d{2}", path.name)
+    )
+    html = render_page(records, month, tasks, life_wheel, cases, available_months)
     return html.encode("utf-8"), month
 
 
@@ -177,6 +185,20 @@ def build_case_pool(config: DashboardConfig) -> bytes:
     vault = config.vault_root.expanduser()
     cases = load_case_ledger(vault / "工作" / "case-ledger.md")
     return render_case_pool_page(cases).encode("utf-8")
+
+
+def encode_http_body(body: bytes, content_type: str, accept_encoding: str) -> tuple[bytes, str | None]:
+    """Compress larger text responses while leaving images and tiny assets alone."""
+    compressible = content_type.startswith("text/") or content_type.startswith(
+        ("application/json", "application/manifest+json")
+    )
+    accepts_gzip = any(
+        token.strip().split(";", 1)[0].lower() == "gzip"
+        for token in accept_encoding.split(",")
+    )
+    if not compressible or not accepts_gzip or len(body) < 1024:
+        return body, None
+    return gzip.compress(body, compresslevel=5), "gzip"
 
 
 
@@ -198,9 +220,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         print(f"{self.log_date_time_string()} {self.client_address[0]} {format % args}", flush=True)
 
     def _send(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
+        body, content_encoding = encode_http_body(
+            body, content_type, self.headers.get("Accept-Encoding", "")
+        )
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Vary", "Accept-Encoding")
+        if content_encoding:
+            self.send_header("Content-Encoding", content_encoding)
         self.send_header("Cache-Control", "no-store, max-age=0")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -223,10 +251,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _send_dashboard(self) -> None:
+    def _send_dashboard(self, requested_month: str | None = None) -> None:
         try:
             with self.server.build_lock:
-                body, month = build_dashboard(self.server.dashboard_config)
+                config = self.server.dashboard_config
+                if requested_month:
+                    if not re.fullmatch(r"\d{4}-\d{2}", requested_month):
+                        self._send(
+                            HTTPStatus.BAD_REQUEST,
+                            b"invalid month\n",
+                            "text/plain; charset=utf-8",
+                        )
+                        return
+                    config = DashboardConfig(
+                        config.vault_root, requested_month, config.work_token_file
+                    )
+                body, month = build_dashboard(config)
                 self.server.last_success_at = datetime.now().astimezone().isoformat(timespec="seconds")
                 self.server.last_month = month
         except Exception as exc:  # request must fail closed rather than serve stale data
@@ -270,7 +310,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _work_authorized(self, token: str) -> bool:
         return work_cookie_authorized(self.headers.get("Cookie", ""), token)
 
-    def _handle_work_get(self, suffix: str) -> None:
+    def _handle_work_get(self, suffix: str, requested_month: str | None = None) -> None:
         token = self._work_token()
         if not token:
             self._send(HTTPStatus.NOT_FOUND, b"not found\n", "text/plain; charset=utf-8")
@@ -293,16 +333,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if suffix == "/cases":
             self._send_case_pool()
         else:
-            self._send_dashboard()
+            self._send_dashboard(requested_month)
 
     def do_HEAD(self) -> None:  # noqa: N802
         self.do_GET()
 
     def do_GET(self) -> None:  # noqa: N802
-        path = urlsplit(self.path).path
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        requested_month = parse_qs(parsed.query).get("month", [None])[0]
         route = work_route(path)
         if route:
-            self._handle_work_get(route[1])
+            self._handle_work_get(route[1], requested_month)
             return
         if path == "/healthz":
             payload = {
@@ -319,7 +361,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.NOT_FOUND, b"not found\n", "text/plain; charset=utf-8")
             return
 
-        self._send_dashboard()
+        self._send_dashboard(requested_month)
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path

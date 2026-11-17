@@ -64,6 +64,16 @@ The filenames are Chinese because they match the original workflow; headings and
 - `soft_due`: your own operational target and the primary sort key.
 - `daily-log`: facts that happened, not a second task manager.
 
+### Optional month-view signals
+
+The month view keeps these signals sparse and opt-in:
+
+- add `- Publish：what shipped` to a day to draw a thin gold ring around its date;
+- add `<!-- month-view: domain=work; axes=out; primary=true -->` immediately below a narrative H3 to give that one title a quiet domain tint;
+- older archives that store narratives as top-level bold bullets remain readable. Anchors are shown only when a day has no narratives.
+
+Repeated `完整饭` lines are counted, PT/cardio chips stay compact, explicit rest is hidden, and sleep/wake facts keep their own row so one kind of fact cannot crowd out another.
+
 ### Privacy
 
 The included sample data is fictional. The program reads only the paths you provide and does not upload vault content. The PWA service worker is network-only and deliberately does not cache private dashboard pages.

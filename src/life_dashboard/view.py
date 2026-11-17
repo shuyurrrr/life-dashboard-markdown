@@ -31,7 +31,7 @@ SECTION_RE = re.compile(r"(?m)^##\s+(.+?)\s*$")
 LIST_RE = re.compile(r"(?m)^-\s+(.+?)\s*$")
 TIME_PREFIX_RE = re.compile(r"^\d{1,2}:\d{2}\s*[·・]\s*")
 LOCATION_RE = re.compile(r"(?:📍|到公司|到家|Wi-Fi first connection)", re.I)
-HOURS_RE = re.compile(r"#\s*([0-9]+(?:\.[0-9]+)?)\s*h\b", re.I)
+HOURS_RE = re.compile(r"(?<![\d.])([0-9]+(?:\.[0-9]+)?)\s*h\b", re.I)
 SLEEP_RE = re.compile(r"(?m)^-\s+(.+?(?:\d+h\d+m|\d+小时\d+分).*?)\s*$")
 SLEEP_DURATION_RE = re.compile(r"(?:\d+h\d+m|\d+小时\d+分)")
 WAKE_SCORE_RE = re.compile(
@@ -45,6 +45,12 @@ TASK_HEADING_RE = re.compile(r"(?m)^##\s+(TASK-[A-Za-z0-9-]+)\s*[·・]\s*(.+?)\
 CASE_HEADING_RE = re.compile(r"(?m)^##\s+(CASE-[A-Za-z0-9-]+)\s*[·・]\s*(.+?)\s*$")
 FIELD_RE = re.compile(r"(?m)^-\s+([A-Za-z_]+)\s*:\s*(.*?)\s*$")
 LIFE_SNAPSHOT_RE = re.compile(r"(?m)^###\s+第.+?张新人生轮\s*[·・]\s*(\d{4}-\d{2}-\d{2})\s*$")
+MONTH_VIEW_META_RE = re.compile(
+    r"<!--\s*month-view:\s*domain=(body|work|life|growth|neutral)"
+    r"(?:;\s*axes=((?:in|out)(?:,(?:in|out))*))?"
+    r"(?:;\s*primary=(true|false))?\s*-->",
+    re.I,
+)
 
 
 @dataclass
@@ -54,6 +60,7 @@ class DayRecord:
     weekday: str
     anchors: list[str]
     narrative_titles: list[str]
+    narrative_meta: list[dict[str, object]]
     sleep: str
     supplement_items: list[str]
     supplement_count: int
@@ -91,15 +98,18 @@ class DayRecord:
     def life_facts(self) -> list[dict[str, str]]:
         facts: list[dict[str, str]] = []
         if self.complete_meals:
-            facts.append({"kind": "body", "label": f"饭 {self.complete_meals}"})
+            meal_count = re.sub(r"\s*顿$", "", self.complete_meals.strip())
+            facts.append({"kind": "fuel", "label": f"饭 {meal_count}"})
         if self.pt:
-            facts.append({"kind": "body", "label": _activity_label("PT", self.pt)})
+            label = _activity_label("PT", self.pt)
+            if label:
+                facts.append({"kind": "movement", "label": label, "title": self.pt})
         if self.cardio:
-            facts.append({"kind": "body", "label": _activity_label("有氧", self.cardio)})
+            label = _activity_label("有氧", self.cardio)
+            if label:
+                facts.append({"kind": "movement", "label": label, "title": self.cardio})
         if self.weekly_hrv:
-            facts.append({"kind": "body", "label": f"HRV {self.weekly_hrv}"})
-        if self.publish:
-            facts.append({"kind": "publish", "label": "发布", "title": self.publish})
+            facts.append({"kind": "recovery", "label": f"HRV {self.weekly_hrv}"})
         return facts
 
 
@@ -178,17 +188,27 @@ def _scalar_value(body: str, label: str) -> str:
     return _known_value(match.group(1)) if match else ""
 
 
+def _complete_meal_count(body: str) -> str:
+    """Count explicit complete-meal facts without interpreting meal composition."""
+    values = re.findall(r"(?m)^-\s+完整饭\s*[：:]\s*(.+?)\s*$", body)
+    total = 0
+    for value in values:
+        if not _known_value(value):
+            continue
+        count_match = re.fullmatch(r"\s*(\d+)\s*顿?\s*", value)
+        total += int(count_match.group(1)) if count_match else 1
+    return str(total) if total else ""
+
+
 def _first_section_with_prefix(sections: dict[str, str], prefix: str) -> str:
     return next((body for heading, body in sections.items() if heading.startswith(prefix)), "")
 
 
 def _activity_label(label: str, value: str) -> str:
     normalized = value.strip().lower()
-    if normalized in {"完成", "做了", "done", "yes", "是", "✓"}:
-        return f"{label} ✓"
-    if normalized in {"休息", "rest", "休"}:
-        return f"{label} 休"
-    return f"{label} {value}"
+    if normalized in {"休息", "rest", "休"} or "休息" in normalized:
+        return ""
+    return label
 
 
 def strip_legacy_eod_status(text: str) -> str:
@@ -218,12 +238,32 @@ def _add_narrative_ids(rendered: str) -> str:
         counter += 1
         return f'<h3 id="narrative-{counter}">{match.group(1)}</h3>'
 
-    narrative_html = re.sub(r"<h3>(.*?)</h3>", label_heading, narrative_html)
+    # Older EOD logs stored each narrative as a bold list item before any H3
+    # narratives.  Give those legacy entries the same stable detail anchors,
+    # but do not mistake bold bullets inside a later H3 narrative for another
+    # narrative.
+    first_h3 = narrative_html.find("<h3>")
+    prefix_end = first_h3 if first_h3 >= 0 else len(narrative_html)
+    prefix, heading_tail = narrative_html[:prefix_end], narrative_html[prefix_end:]
+
+    def label_legacy_bullet(match: re.Match[str]) -> str:
+        nonlocal counter
+        counter += 1
+        return match.group(0).replace(
+            "<strong>", f'<strong id="narrative-{counter}">', 1
+        )
+
+    prefix = re.sub(
+        r"(?s)<li>\s*(?:<p>)?<strong>.*?</strong>", label_legacy_bullet, prefix
+    )
+    heading_tail = re.sub(r"<h3>(.*?)</h3>", label_heading, heading_tail)
+    narrative_html = prefix + heading_tail
     return before + marker + narrative_html + tail[end:]
 
 
 def render_markdown(text: str) -> str:
     text = strip_legacy_eod_status(text)
+    text = MONTH_VIEW_META_RE.sub("", text)
     if MarkdownIt is None:
         return f"<pre>{html.escape(text)}</pre>"
     rendered = MarkdownIt("commonmark", {"html": False, "linkify": False}).enable("table").render(text)
@@ -384,11 +424,35 @@ def parse_day(path: Path, iso_date_override: str | None = None) -> DayRecord:
     anchors = [TIME_PREFIX_RE.sub("", item).strip() for item in LIST_RE.findall(anchor_body)]
 
     narrative_body = sections.get("§ Narratives", "")
-    narrative_titles = [
-        match.strip().lstrip("§ ").strip()
-        for match in re.findall(r"(?m)^###\s+(.+?)\s*$", narrative_body)
-        if not match.strip().startswith("*(")
-    ]
+    narrative_titles: list[str] = []
+    narrative_meta: list[dict[str, object]] = []
+    narrative_headings = list(re.finditer(r"(?m)^###\s+(.+?)\s*$", narrative_body))
+    # v4 history contains two valid archive shapes.  Legacy entries are bold
+    # top-level bullets; newer entries are H3 sections.  Only inspect the
+    # prefix before the first H3 so bold bullets inside an H3 body remain body
+    # text rather than being double-counted as narratives.
+    legacy_prefix_end = narrative_headings[0].start() if narrative_headings else len(narrative_body)
+    for match in re.finditer(
+        r"(?m)^-\s+\*\*(.+?)\*\*(?:[：:]\s*|\s+|$)",
+        narrative_body[:legacy_prefix_end],
+    ):
+        title = match.group(1).strip().lstrip("§ ").strip()
+        narrative_titles.append(title)
+        narrative_meta.append(
+            {"title": title, "domain": "neutral", "axes": [], "primary": False}
+        )
+    for index, match in enumerate(narrative_headings):
+        raw_title = match.group(1).strip()
+        if raw_title.startswith("*("):
+            continue
+        title = raw_title.lstrip("§ ").strip()
+        next_heading = narrative_headings[index + 1].start() if index + 1 < len(narrative_headings) else len(narrative_body)
+        metadata_match = MONTH_VIEW_META_RE.search(narrative_body, match.end(), next_heading)
+        domain = metadata_match.group(1).lower() if metadata_match else "neutral"
+        axes = metadata_match.group(2).lower().split(",") if metadata_match and metadata_match.group(2) else []
+        primary = bool(metadata_match and metadata_match.group(3) == "true")
+        narrative_titles.append(title)
+        narrative_meta.append({"title": title, "domain": domain, "axes": axes, "primary": primary})
 
     sleep_body = _first_section_with_prefix(sections, "Sleep")
     sleep_match = SLEEP_RE.search(sleep_body)
@@ -428,12 +492,13 @@ def parse_day(path: Path, iso_date_override: str | None = None) -> DayRecord:
         weekday=f"周{weekday}",
         anchors=anchors,
         narrative_titles=narrative_titles,
+        narrative_meta=narrative_meta,
         sleep=sleep,
         supplement_items=supplement_items,
         supplement_count=len(supplement_items) + stack_count,
         billing_hours=round(billing_hours, 2),
         wake_score=wake_score,
-        complete_meals=_scalar_value(body_facts, "完整饭"),
+        complete_meals=_complete_meal_count(body_facts),
         pt=_scalar_value(body_facts, "PT"),
         cardio=_scalar_value(body_facts, "Cardio"),
         weekly_hrv=_scalar_value(body_facts, "7d HRV"),
@@ -657,6 +722,7 @@ def render_page(
     tasks: list[TaskRecord] | None = None,
     life_wheel: LifeWheel | None = None,
     cases: list[CaseRecord] | None = None,
+    available_months: list[str] | None = None,
 ) -> str:
     year, month_number = map(int, month.split("-"))
     first_weekday, days_in_month = calendar.monthrange(year, month_number)
@@ -676,6 +742,18 @@ def render_page(
     life_json = safe_json(asdict(life_wheel) if life_wheel else None)
     task_html = _task_strip_html(tasks or [], cases or [])
     life_html = _life_summary_html(life_wheel)
+    months = sorted(set(available_months or [month]))
+    month_index = months.index(month) if month in months else 0
+    previous_month = months[month_index - 1] if month_index > 0 else ""
+    next_month = months[month_index + 1] if month_index + 1 < len(months) else ""
+    previous_link = (
+        f'<a class="month-step" href="?month={previous_month}" aria-label="上一个月">←</a>'
+        if previous_month else '<span class="month-step disabled" aria-hidden="true">←</span>'
+    )
+    next_link = (
+        f'<a class="month-step" href="?month={next_month}" aria-label="下一个月">→</a>'
+        if next_month else '<span class="month-step disabled" aria-hidden="true">→</span>'
+    )
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -688,8 +766,12 @@ def render_page(
       color-scheme: light;
       --ink: #24312b; --muted: #6d786f; --paper: #f6f0e5;
       --card: rgba(255, 253, 248, .92); --line: #ded5c6;
-      --moss: #496858; --moss-pale: #e3eadf; --clay: #b76f52;
-      --narrative: #eee8dc; --gold-pale: #efe3bd; --alert: #9b3f37;
+      --moss: #496858; --moss-pale: #e5ebe2; --clay: #b77a66;
+      --work-pale: #e3e9e8; --work-ink: #4f605f;
+      --life-pale: #f3ddd2; --growth-pale: #f5ebcf; --narrative: #f1ede5;
+      --recovery-pale: #f0edf2; --recovery-ink: #5d5962;
+      --fuel-pale: #f5e9cb; --fuel-ink: #6f6040;
+      --gold: #b48a35; --gold-pale: #f5ebcf; --alert: #9b3f37;
       --shadow: 0 16px 44px rgba(67, 55, 39, .10);
     }}
     * {{ box-sizing: border-box; }}
@@ -703,6 +785,11 @@ def render_page(
       align-items: end; margin-bottom: 30px; }}
     .eyebrow {{ color: var(--clay); letter-spacing: .16em; font: 700 12px/1.5 ui-sans-serif, sans-serif; }}
     h1 {{ margin: 7px 0 8px; font-size: clamp(32px, 5vw, 62px); font-weight: 500; letter-spacing: -.04em; }}
+    .month-heading {{ display: flex; align-items: center; gap: 13px; }}
+    .month-step {{ display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--line);
+      border-radius: 999px; color: var(--moss); background: rgba(255,255,255,.56); text-decoration: none;
+      font: 700 17px/1 ui-sans-serif, sans-serif; }}
+    .month-step:hover {{ border-color: var(--moss); }} .month-step.disabled {{ opacity: .28; }}
     .subtitle {{ color: var(--muted); max-width: 670px; line-height: 1.7; }}
     .stats {{ display: flex; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }}
     .stat {{ padding: 10px 14px; border: 1px solid var(--line); border-radius: 999px;
@@ -794,6 +881,8 @@ def render_page(
     .day-card:focus-visible {{ outline: 3px solid rgba(73,104,88,.35); outline-offset: 2px; }}
     .day-top {{ display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }}
     .day-number {{ font-size: 30px; line-height: 1; }}
+    .day-number.published {{ display: grid; place-items: center; width: 37px; height: 37px; margin: -4px 0 -4px -5px;
+      border: 1.5px solid var(--gold); border-radius: 50%; }}
     .day-week {{ color: var(--muted); font: 700 11px/1 ui-sans-serif, sans-serif; }}
     .title-scroll-wrap {{ position: relative; margin-top: 14px; }}
     .title-scroll {{ max-height: 117px; overflow-y: auto; overscroll-behavior: contain; padding-right: 5px;
@@ -804,17 +893,27 @@ def render_page(
     .title-scroll-wrap.has-more::after {{ content: ""; position: absolute; left: 0; right: 5px; bottom: 0; height: 12px;
       pointer-events: none; background: linear-gradient(to bottom, rgba(255,253,248,0), var(--card)); }}
     .title-list {{ list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }}
-    .title-list li {{ position: relative; box-sizing: border-box; width: fit-content; max-width: 100%; height: 15px;
-      padding: 0 7px 0 14px; border-radius: 5px; background: var(--narrative); color: #403b34;
-      font-size: 11px; font-weight: 650; line-height: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-    .title-list li::before {{ content: ""; position: absolute; left: 6px; top: 5.5px; width: 4px; height: 4px; border-radius: 50%; background: var(--clay); }}
+    .title-list li {{ position: relative; box-sizing: border-box; display: flex; align-items: center;
+      width: fit-content; max-width: 100%; height: 15px; padding: 0 3px; border-radius: 4px;
+      background: transparent; color: #403b34;
+      font-size: 11px; font-weight: 650; line-height: 15px; }}
+    .title-list li.primary {{ padding: 0 7px; font-weight: 720; }}
+    .title-list li.primary.domain-body {{ background: var(--moss-pale); }}
+    .title-list li.primary.domain-work {{ background: var(--work-pale); }}
+    .title-list li.primary.domain-life {{ background: var(--life-pale); }}
+    .title-list li.primary.domain-growth {{ background: var(--growth-pale); }}
+    .title-list li.primary.domain-neutral {{ background: var(--narrative); }}
+    .title-text {{ min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
     .more {{ margin-top: 10px; color: var(--muted); font: 600 11px/1.4 ui-sans-serif, sans-serif; }}
-    .facts {{ display: grid; gap: 5px; margin-top: auto; padding-top: 12px; }}
-    .meta {{ color: var(--muted); text-align: right; font: 600 10px/1.35 ui-sans-serif, sans-serif; }}
-    .life-facts {{ display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; min-height: 16px; }}
+    .facts {{ display: grid; gap: 4px; margin-top: auto; padding-top: 12px; }}
+    .primary-facts, .life-facts {{ display: flex; flex-wrap: nowrap; justify-content: flex-end; gap: 4px;
+      min-height: 16px; max-height: 17px; overflow: hidden; }}
     .fact {{ padding: 2px 6px; border-radius: 999px; background: var(--moss-pale); color: #31463b;
-      font: 700 9px/1.35 ui-sans-serif, sans-serif; white-space: nowrap; }}
-    .fact.publish {{ background: var(--gold-pale); color: #6f5423; }}
+      max-width: 88px; overflow: hidden; text-overflow: ellipsis; font: 700 9px/1.35 ui-sans-serif, sans-serif; white-space: nowrap; }}
+    .fact.work {{ background: var(--work-pale); color: var(--work-ink); }}
+    .fact.recovery {{ background: var(--recovery-pale); color: var(--recovery-ink); }}
+    .fact.fuel {{ background: var(--fuel-pale); color: var(--fuel-ink); }}
+    .fact.movement {{ background: var(--moss-pale); color: #31463b; }}
     .day-card.guardrail {{ border-color: rgba(155,63,55,.5); }}
     .day-card.guardrail::after {{ content: ""; position: absolute; top: 10px; right: 10px; width: 6px; height: 6px;
       border-radius: 50%; background: var(--alert); }}
@@ -854,7 +953,7 @@ def render_page(
   <main class="shell">
     <header>
       <div><div class="eyebrow">LIFE DASHBOARD · DAILY ARCHIVE</div>
-        <h1>{year} 年 {month_number} 月</h1>
+        <div class="month-heading">{previous_link}<h1>{year} 年 {month_number} 月</h1>{next_link}</div>
         <div class="subtitle">一个事实源，三种时间：此刻正在交付什么、这个月怎样真实发生、生活整体正在往哪里长。</div></div>
       <div class="stats"><span class="stat">{len(records)} 天有记录</span><span class="stat">{narrative_count} 段叙事</span><span class="stat">工作记录 {total_hours:g}h</span></div>
     </header>
@@ -885,14 +984,30 @@ def render_page(
     for (let day = 1; day <= daysInMonth; day++) {{
       const r = byDay.get(day);
       if (!r) {{ calendarEl.insertAdjacentHTML('beforeend', `<div class="day-card empty" data-day="${{day}}"><div class="day-top"><span class="day-number">${{day}}</span></div>尚无归档</div>`); continue; }}
-      const titles = r.card_titles.map(title => `<li title="${{escapeText(title)}}">${{escapeText(title)}}</li>`).join('');
+      const narratives = r.narrative_meta?.length
+        ? r.narrative_meta
+        : r.card_titles.map(title => ({{title, domain:'neutral', axes:[], primary:false}}));
+      const titles = narratives.map(item => {{
+        const primary = item.primary ? ' primary' : '';
+        return `<li class="domain-${{escapeText(item.domain || 'neutral')}}${{primary}}" title="${{escapeText(item.title)}}"><span class="title-text">${{escapeText(item.title)}}</span></li>`;
+      }}).join('');
       const more = r.narrative_titles.length ? `共 ${{r.narrative_titles.length}} 段` : (r.anchors.length ? `${{r.anchors.length}} 个 anchor` : '');
-      const meta = [r.sleep_duration ? `睡眠 ${{r.sleep_duration}}` : '', r.wake_score ? `醒 ${{r.wake_score}}/5` : '', r.billing_hours ? `工作 ${{r.billing_hours}}h` : ''].filter(Boolean).join(' · ');
-      const lifeFacts = r.life_facts.map(f => `<span class="fact ${{escapeText(f.kind)}}" title="${{escapeText(f.title || f.label)}}">${{escapeText(f.label)}}</span>`).join('');
+      const primaryFacts = [
+        r.sleep_duration ? {{kind:'recovery', label:`睡 ${{r.sleep_duration}}`, title:r.sleep}} : null,
+        r.wake_score ? {{kind:'recovery', label:`醒 ${{r.wake_score}}/5`, title:`醒来感觉 ${{r.wake_score}}/5`}} : null,
+      ].filter(Boolean);
+      const primaryHtml = primaryFacts.map(f => `<span class="fact ${{escapeText(f.kind)}}" title="${{escapeText(f.title || f.label)}}">${{escapeText(f.label)}}</span>`).join('');
+      const secondaryFacts = [
+        r.billing_hours ? {{kind:'work', label:`工作 ${{r.billing_hours}}h`, title:`工作记录 ${{r.billing_hours}}h`}} : null,
+        ...r.life_facts,
+      ].filter(Boolean);
+      const lifeFacts = secondaryFacts.map(f => `<span class="fact ${{escapeText(f.kind)}}" title="${{escapeText(f.title || f.label)}}">${{escapeText(f.label)}}</span>`).join('');
       const searchText = [r.iso_date, ...r.anchors, ...r.narrative_titles, ...r.supplement_items, r.sleep, ...r.life_facts.map(f => f.label), r.publish, r.guardrail].join(' ').toLowerCase();
       const guardrailClass = r.guardrail ? ' guardrail' : '';
       const guardrailTitle = r.guardrail ? ` data-guardrail="${{escapeText(r.guardrail)}}"` : '';
-      calendarEl.insertAdjacentHTML('beforeend', `<article class="day-card${{guardrailClass}}" tabindex="0" role="button" data-day="${{day}}" data-search="${{escapeText(searchText)}}"${{guardrailTitle}}><div class="day-top"><span class="day-number">${{day}}</span><span class="day-week">${{r.weekday}}</span></div><div class="title-scroll-wrap"><div class="title-scroll" aria-label="当天全部叙事标题"><ul class="title-list">${{titles}}</ul></div></div>${{more ? `<div class="more">${{more}}</div>` : ''}}<div class="facts">${{meta ? `<div class="meta">${{meta}}</div>` : ''}}${{lifeFacts ? `<div class="life-facts">${{lifeFacts}}</div>` : ''}}</div></article>`);
+      const published = r.publish ? ' published' : '';
+      const publishTitle = r.publish ? ` title="${{escapeText(r.publish)}}"` : '';
+      calendarEl.insertAdjacentHTML('beforeend', `<article class="day-card${{guardrailClass}}" tabindex="0" role="button" data-day="${{day}}" data-search="${{escapeText(searchText)}}"${{guardrailTitle}}><div class="day-top"><span class="day-number${{published}}"${{publishTitle}}>${{day}}</span><span class="day-week">${{r.weekday}}</span></div><div class="title-scroll-wrap"><div class="title-scroll" aria-label="当天全部叙事标题"><ul class="title-list">${{titles}}</ul></div></div>${{more ? `<div class="more">${{more}}</div>` : ''}}<div class="facts">${{primaryHtml ? `<div class="primary-facts">${{primaryHtml}}</div>` : ''}}${{lifeFacts ? `<div class="life-facts">${{lifeFacts}}</div>` : ''}}</div></article>`);
     }}
 
     document.querySelectorAll('.title-scroll').forEach(scroller => {{

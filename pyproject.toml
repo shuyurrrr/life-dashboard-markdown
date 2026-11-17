@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "life-dashboard-markdown"
+version = "0.1.0"
+description = "A local-first, read-only life dashboard generated from Markdown or Obsidian files."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "Shuyu Ruan"}]
+dependencies = ["markdown-it-py>=3.0"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+life-dashboard = "life_dashboard.view:main"
+life-dashboard-serve = "life_dashboard.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
